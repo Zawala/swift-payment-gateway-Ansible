@@ -1,0 +1,30 @@
+[Unit]
+Description={{ service_description }}
+After=network.target
+
+[Service]
+Type=simple
+User={{ app_user }}
+WorkingDirectory={{ app_dir }}
+
+ExecStart=/usr/bin/java \
+  -Dspring.profiles.active={{ spring_profile }} \
+  -Dserver.port={{ service_port }} \
+  -jar {{ jar_path }}
+
+Restart=on-failure
+RestartSec=10
+
+# Environment — secrets injected here, never in application.properties
+Environment="JWT_SECRET={{ jwt_secret }}"
+{% if db_username | length > 0 %}
+Environment="DB_USERNAME={{ db_username }}"
+Environment="DB_PASSWORD={{ db_password }}"
+{% endif %}
+
+# Harden the service
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

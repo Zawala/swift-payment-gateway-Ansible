@@ -1,0 +1,230 @@
+---
+# =============================================================================
+# FortKnox Payment Stack — Ansible Deployment Playbook
+#
+# Pulls both repos, builds the JARs, and runs them as systemd services.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini deploy.yml
+#   ansible-playbook -i inventory.ini deploy.yml -e "spring_profile=uat"
+#   ansible-playbook -i inventory.ini deploy.yml --tags zw
+#   ansible-playbook -i inventory.ini deploy.yml --tags capital
+#
+# Required variables (set here or pass with -e):
+#   zw_repo_url       Git URL for the ZW service
+#   capital_repo_url  Git URL for the Capital service
+#   jwt_secret        Shared JWT signing secret (min 32 chars)
+#
+# Optional:
+#   spring_profile    dev | uat | prod  (default: prod)
+#   db_username       PostgreSQL username (uat/prod only)
+#   db_password       PostgreSQL password (uat/prod only)
+# =============================================================================
+
+- name: Deploy FortKnox Payment Stack
+  hosts: app_servers
+  become: true
+
+  vars:
+    spring_profile: prod
+
+    zw_repo_url: ""         # e.g. https://github.com/your-org/zw.git
+    capital_repo_url: ""    # e.g. https://github.com/your-org/capital.git
+
+    jwt_secret: ""          # must match on both services — min 32 chars
+    db_username: ""
+    db_password: ""
+
+    app_user: fortknox
+    app_dir: /opt/fortknox
+    zw_dir: "{{ app_dir }}/zw"
+    capital_dir: "{{ app_dir }}/capital"
+    zw_port: 8080
+    capital_port: 8460
+    java_home: /usr/lib/jvm/java-21-openjdk-amd64   # adjust for your distro
+
+  # ---------------------------------------------------------------------------
+  pre_tasks:
+
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - zw_repo_url | length > 0
+          - capital_repo_url | length > 0
+          - jwt_secret | length >= 32
+        fail_msg: >
+          Set zw_repo_url, capital_repo_url, and jwt_secret (min 32 chars).
+          Pass them with -e or define them in group_vars/all.yml.
+
+  # ---------------------------------------------------------------------------
+  tasks:
+
+    # ── Prerequisites ─────────────────────────────────────────────────────────
+
+    - name: Install Java, Maven, and Git
+      ansible.builtin.apt:
+        name:
+          - openjdk-21-jdk
+          - maven
+          - git
+        state: present
+        update_cache: true
+      tags: [prereqs]
+
+    - name: Create application user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        system: true
+        shell: /sbin/nologin
+        home: "{{ app_dir }}"
+        create_home: true
+      tags: [prereqs]
+
+    - name: Create app directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0750"
+      tags: [prereqs]
+
+    # ── ZW ────────────────────────────────────────────────────────────────────
+
+    - name: Clone or update ZW repository
+      ansible.builtin.git:
+        repo: "{{ zw_repo_url }}"
+        dest: "{{ zw_dir }}"
+        version: main
+        force: true
+      become_user: "{{ app_user }}"
+      tags: [zw]
+
+    - name: Build ZW JAR
+      ansible.builtin.command:
+        cmd: mvn clean package -P {{ spring_profile }} -DskipTests --no-transfer-progress
+        chdir: "{{ zw_dir }}"
+      become_user: "{{ app_user }}"
+      environment:
+        JAVA_HOME: "{{ java_home }}"
+      tags: [zw]
+
+    - name: Deploy ZW systemd service
+      ansible.builtin.template:
+        src: templates/spring-service.j2
+        dest: /etc/systemd/system/zw.service
+        mode: "0644"
+      vars:
+        service_name: zw
+        service_description: FortKnox ZW Auth & Gateway Service
+        jar_path: "{{ zw_dir }}/target/zw-0.0.1-SNAPSHOT.jar"
+        service_port: "{{ zw_port }}"
+      notify: Reload systemd
+      tags: [zw]
+
+    - name: Enable and start ZW
+      ansible.builtin.systemd:
+        name: zw
+        enabled: true
+        state: started
+        daemon_reload: true
+      tags: [zw]
+
+    - name: Wait for ZW to be ready
+      ansible.builtin.uri:
+        url: "http://localhost:{{ zw_port }}/ping"
+        method: GET
+        status_code: [200, 401]   # 401 = up but unauthenticated (expected)
+      register: zw_health
+      retries: 12
+      delay: 5
+      until: zw_health.status in [200, 401]
+      tags: [zw]
+
+    # ── Capital ───────────────────────────────────────────────────────────────
+
+    - name: Clone or update Capital repository
+      ansible.builtin.git:
+        repo: "{{ capital_repo_url }}"
+        dest: "{{ capital_dir }}"
+        version: main
+        force: true
+      become_user: "{{ app_user }}"
+      tags: [capital]
+
+    - name: Generate JAXB classes from XSD (Capital only)
+      ansible.builtin.command:
+        cmd: mvn generate-sources -P {{ spring_profile }} --no-transfer-progress
+        chdir: "{{ capital_dir }}"
+      become_user: "{{ app_user }}"
+      environment:
+        JAVA_HOME: "{{ java_home }}"
+      tags: [capital]
+
+    - name: Build Capital JAR
+      ansible.builtin.command:
+        cmd: mvn clean package -P {{ spring_profile }} -DskipTests --no-transfer-progress
+        chdir: "{{ capital_dir }}"
+      become_user: "{{ app_user }}"
+      environment:
+        JAVA_HOME: "{{ java_home }}"
+      tags: [capital]
+
+    - name: Deploy Capital systemd service
+      ansible.builtin.template:
+        src: templates/spring-service.j2
+        dest: /etc/systemd/system/capital.service
+        mode: "0644"
+      vars:
+        service_name: capital
+        service_description: Capital ISO 20022 Payments Processor
+        jar_path: "{{ capital_dir }}/target/capital-0.0.1-SNAPSHOT.jar"
+        service_port: "{{ capital_port }}"
+      notify: Reload systemd
+      tags: [capital]
+
+    - name: Enable and start Capital
+      ansible.builtin.systemd:
+        name: capital
+        enabled: true
+        state: started
+        daemon_reload: true
+      tags: [capital]
+
+    - name: Wait for Capital to be ready
+      ansible.builtin.uri:
+        url: "http://localhost:{{ capital_port }}/actuator/health"
+        method: GET
+        status_code: 200
+      register: capital_health
+      retries: 12
+      delay: 5
+      until: capital_health.status == 200
+      tags: [capital]
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+
+    - name: Deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "ZW    : http://{{ inventory_hostname }}:{{ zw_port }}"
+          - "Capital : http://{{ inventory_hostname }}:{{ capital_port }}"
+          - "Profile : {{ spring_profile }}"
+      tags: [always]
+
+  # ---------------------------------------------------------------------------
+  handlers:
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart ZW
+      ansible.builtin.systemd:
+        name: zw
+        state: restarted
+
+    - name: Restart Capital
+      ansible.builtin.systemd:
+        name: capital
+        state: restarted

@@ -5,18 +5,16 @@
 #   ansible-vault encrypt_string 'your-secret' --name jwt_secret
 # =============================================================================
 
-spring_profile: prod
+spring_profile: dev
 
-zw_repo_url: "git@github.com:Zawala/fortknox.git"
-capital_repo_url: "git@github.com:Zawala/capitalOne.git"
+zw_repo_url: "file:///home/user/Documents/github/payments_iso_standard/zw"
+capital_repo_url: "file:///home/user/Documents/github/payments_iso_standard/capital"
 
 # Shared JWT secret — must be identical on ZW and Capital (min 32 chars)
-jwt_secret: ""        # store with ansible-vault
+jwt_secret: "NmFhNzk1MjQ5Y2I1NDYxOTFkZWFiYmQzOGE0Y2Y5NDAyM2M0ZDMxYmQzYjczN2JiOWZmOTZmNTIxZWZlNzYxZGY5M2I4YjNlM2QwZGQ2YjA3N2U2Y2Y5YThjODM2OGJjMTAwY2ZhMTA3MGU3MmNkYjJlNDA3MjdmYjBlNTA1YTY"        # store with ansible-vault
 
 # PostgreSQL credentials (required for uat/prod)
 db_username: ""
 db_password: ""       # store with ansible-vault
 
-app_user: fortknox
-app_dir: /opt/fortknox
-java_home: /usr/lib/jvm/java-21-openjdk-amd64
+java_home: /usr/lib/jvm/java-25-openjdk-amd64

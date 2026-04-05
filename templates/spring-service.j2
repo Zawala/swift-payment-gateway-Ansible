@@ -10,6 +10,8 @@ WorkingDirectory={{ app_dir }}
 ExecStart=/usr/bin/java \
   -Dspring.profiles.active={{ spring_profile }} \
   -Dserver.port={{ service_port }} \
+  -Dlogging.level.root=DEBUG \
+  -Dlogging.file.name=/var/log/fortknox/{{ service_name }}.log \
   -jar {{ jar_path }}
 
 Restart=on-failure
@@ -21,6 +23,11 @@ Environment="JWT_SECRET={{ jwt_secret }}"
 Environment="DB_USERNAME={{ db_username }}"
 Environment="DB_PASSWORD={{ db_password }}"
 {% endif %}
+
+# Logging — stdout goes to journald; file log written under /var/log/fortknox/
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ service_name }}
 
 # Harden the service
 NoNewPrivileges=true

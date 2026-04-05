@@ -251,3 +251,155 @@ cd capital
 mvn clean package -P prod -DskipTests
 JWT_SECRET=<secret> java -jar target/capital-0.0.1-SNAPSHOT.jar
 ```
+
+---
+
+## Capital — ISO 20022 Gateway Detail
+
+### Technology
+
+| Concern | Technology |
+|---|---|
+| Runtime | Java 25 / Spring Boot 4.0.4 |
+| Message standard | ISO 20022 (SWIFT XML) |
+| Schema binding | JAXB 4 via `jaxb2-maven-plugin` |
+| Persistence | Spring Data JPA / PostgreSQL (H2 in dev) |
+| Security | Spring Security |
+| Build | Maven |
+
+### Supported Message Types
+
+| Flow | Direction | ISO 20022 Message | XSD |
+|---|---|---|---|
+| Payment | Outbound | FIToFI Customer Credit Transfer | `pacs.008.001.14` |
+| Payment Response | Inbound | FIToFI Payment Status Report | `pacs.002.001.16` |
+| Payment Return | Outbound | Payment Return | `pacs.004.001.15` |
+| Payment Return Response | Inbound | FIToFI Payment Status Report | `pacs.002.001.16` |
+| Status Request | Outbound | FIToFI Payment Status Request | `pacs.028.001.07` |
+| Status Response | Inbound | FIToFI Payment Status Report | `pacs.002.001.16` |
+| AVS Request | Outbound | Identification Verification Request | `acmt.023.001.04` |
+| AVS Response | Inbound | Identification Verification Report | `acmt.024.001.04` |
+
+### API Reference
+
+#### POST `/api/v1/payments/transfer`
+
+```json
+{
+  "firstName": "John",
+  "lastName": "Doe",
+  "debtorAccountNumber": "4083265412",
+  "creditorAgentBic": "ABCDZAJJXXX",
+  "creditorName": "Jane Smith",
+  "creditorAccountNumber": "9876543210",
+  "amount": 1500.00,
+  "currency": "ZAR",
+  "remittanceInfo": "Invoice INV-2026-001"
+}
+```
+
+Response: `200 OK` — raw pacs.002 XML from the destination institution.
+
+#### POST `/api/v1/avs/verify`
+
+```json
+{
+  "firstName": "Jane",
+  "lastName": "Smith",
+  "accountNumber": "9876543210",
+  "bankBic": "ABCDZAJJXXX"
+}
+```
+
+Response: `200 OK`
+```json
+{
+  "verified": true,
+  "referenceId": "REF-A1B2C3D4E5F6G7H8",
+  "reasonCode": null,
+  "registeredName": "Jane Smith",
+  "registeredAccount": "9876543210"
+}
+```
+
+### Database Schema
+
+**`transfer_log`** — one row per payment attempt
+
+| Column | Type | Notes |
+|---|---|---|
+| `message_id` | VARCHAR | Unique pacs.008 MsgId |
+| `end_to_end_id` | VARCHAR | pacs.008 EndToEndId |
+| `debtor_name` | VARCHAR | Client full name |
+| `debtor_account` | VARCHAR | Client account number |
+| `creditor_name` | VARCHAR | Beneficiary name |
+| `creditor_account` | VARCHAR | Beneficiary account |
+| `amount` | DECIMAL(18,5) | Transfer amount |
+| `currency` | CHAR(3) | ISO 4217 |
+| `status` | VARCHAR | PENDING / SENT / FAILED |
+| `raw_xml_sent` | TEXT | Full pacs.008 XML |
+| `response_body` | TEXT | Raw response from institution |
+| `created_at` | TIMESTAMP | Set on insert |
+
+**`avs_log`** — one row per AVS verification
+
+| Column | Type | Notes |
+|---|---|---|
+| `message_id` | VARCHAR | Unique acmt.023 MsgId |
+| `reference_id` | VARCHAR | acmt.023 Vrfctn.Id |
+| `account_holder_name` | VARCHAR | Name submitted for verification |
+| `account_number` | VARCHAR | Account submitted for verification |
+| `bank_bic` | VARCHAR | Queried bank BIC |
+| `verified` | BOOLEAN | null = no response yet |
+| `reason_code` | VARCHAR | ISO reason code on mismatch |
+| `status` | VARCHAR | PENDING / SENT / FAILED |
+| `raw_xml_sent` | TEXT | Full acmt.023 XML |
+| `raw_xml_received` | TEXT | Full acmt.024 XML |
+| `created_at` | TIMESTAMP | Set on insert |
+
+### Institution Configuration
+
+All institution-level settings live in `application.properties`:
+
+```properties
+institution.name=Capital One Bank
+institution.bic=CAPZAZJJXXX
+institution.country=ZA
+institution.street=123 Bank Street
+institution.city=Johannesburg
+institution.postal-code=2001
+institution.creditor-agent-url=https://receive.org/api/v2/credit
+institution.avs-url=https://receive.org/api/v2/avs
+```
+
+The destination bank BIC (`creditorAgentBic` / `bankBic`) is supplied per request — it is not stored in config.
+
+### Mock Downstream (dev only)
+
+All outbound ISO 20022 calls are intercepted locally by `MockDownstreamController`:
+
+| Endpoint | Message sent | Mock response |
+|---|---|---|
+| `POST /mock/credit` | pacs.008 | pacs.002 `TxSts=ACCC` |
+| `POST /mock/status` | pacs.028 | pacs.002 `TxSts=ACCC` |
+| `POST /mock/return` | pacs.004 | pacs.002 `TxSts=ACCP` |
+| `POST /mock/avs` | acmt.023 | acmt.024 `verified=true` |
+
+### Test Script
+
+```bash
+cd capital
+./scripts/test-flow.sh
+
+# Against a different host
+BASE_URL=http://payments:8460 ZW_URL=http://auth:8080 ./scripts/test-flow.sh
+
+# Run 50 randomised batch transactions (default 12)
+BATCH_COUNT=50 ./scripts/test-flow.sh
+
+# Skip AVS + transfer if you already have a msgId
+MSG_ID=MSG-ABCDEF1234567890 ./scripts/test-flow.sh
+
+# Custom return reason
+REASON_CODE=MD06 ./scripts/test-flow.sh
+```

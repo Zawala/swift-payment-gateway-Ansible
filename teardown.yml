@@ -1,0 +1,102 @@
+---
+# =============================================================================
+# FortKnox Payment Stack — Teardown Playbook
+#
+# Stops and removes everything deployed by deploy.yml:
+#   services, systemd units, Kafka container, repo clones, logs
+#
+# Usage:
+#   ansible-playbook -i inventory.ini teardown.yml --ask-become-pass
+#   ansible-playbook -i inventory.ini teardown.yml --ask-become-pass --tags services
+#   ansible-playbook -i inventory.ini teardown.yml --ask-become-pass --tags kafka
+# =============================================================================
+
+- name: Teardown FortKnox Payment Stack
+  hosts: app_servers
+  become: true
+
+  vars:
+    app_dir: "{{ playbook_dir }}/repo"
+    kafka_container_name: fortknox-kafka
+
+  pre_tasks:
+    - name: Get real user running the playbook
+      ansible.builtin.command: whoami
+      become: false
+      register: _real_user
+      changed_when: false
+
+    - name: Set app_user to real user
+      ansible.builtin.set_fact:
+        app_user: "{{ _real_user.stdout }}"
+
+  tasks:
+
+    # ── Services ──────────────────────────────────────────────────────────────
+
+    - name: Stop and disable ZW service
+      ansible.builtin.systemd:
+        name: zw
+        state: stopped
+        enabled: false
+      failed_when: false
+      tags: [services, zw]
+
+    - name: Stop and disable Capital service
+      ansible.builtin.systemd:
+        name: capital
+        state: stopped
+        enabled: false
+      failed_when: false
+      tags: [services, capital]
+
+    - name: Remove ZW systemd unit
+      ansible.builtin.file:
+        path: /etc/systemd/system/zw.service
+        state: absent
+      notify: Reload systemd
+      tags: [services, zw]
+
+    - name: Remove Capital systemd unit
+      ansible.builtin.file:
+        path: /etc/systemd/system/capital.service
+        state: absent
+      notify: Reload systemd
+      tags: [services, capital]
+
+    # ── Kafka ─────────────────────────────────────────────────────────────────
+
+    - name: Stop and remove Kafka container
+      community.docker.docker_container:
+        name: "{{ kafka_container_name }}"
+        state: absent
+        force_kill: true
+      failed_when: false
+      tags: [kafka]
+
+    # ── Repo clones ───────────────────────────────────────────────────────────
+
+    - name: Remove cloned repositories
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: absent
+      become: false
+      tags: [repos]
+
+    # ── Logs ──────────────────────────────────────────────────────────────────
+
+    - name: Remove log directory
+      ansible.builtin.file:
+        path: /var/log/fortknox
+        state: absent
+      tags: [logs]
+
+    - name: Teardown complete
+      ansible.builtin.debug:
+        msg: "FortKnox stack removed — services, Kafka, repos, and logs deleted."
+      tags: [always]
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true

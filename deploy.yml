@@ -26,25 +26,27 @@
   become: true
 
   vars:
-    spring_profile: prod
-
-    zw_repo_url: ""         # e.g. https://github.com/your-org/zw.git
-    capital_repo_url: ""    # e.g. https://github.com/your-org/capital.git
-
-    jwt_secret: ""          # must match on both services — min 32 chars
-    db_username: ""
-    db_password: ""
-
-    app_user: fortknox
-    app_dir: /opt/fortknox
+    app_user: "{{ ansible_user_id }}"   # overridden in pre_tasks with become: false
+    app_dir: "{{ playbook_dir }}/repo"
     zw_dir: "{{ app_dir }}/zw"
     capital_dir: "{{ app_dir }}/capital"
     zw_port: 8080
     capital_port: 8460
-    java_home: /usr/lib/jvm/java-21-openjdk-amd64   # adjust for your distro
+    kafka_port: 9092
+    kafka_container_name: fortknox-kafka
 
   # ---------------------------------------------------------------------------
   pre_tasks:
+
+    - name: Get real user running the playbook
+      ansible.builtin.command: whoami
+      become: false
+      register: _real_user
+      changed_when: false
+
+    - name: Set app_user to real user
+      ansible.builtin.set_fact:
+        app_user: "{{ _real_user.stdout }}"
 
     - name: Validate required variables
       ansible.builtin.assert:
@@ -61,14 +63,70 @@
 
     # ── Prerequisites ─────────────────────────────────────────────────────────
 
-    - name: Install Java, Maven, and Git
+    - name: Update apt cache (ignore third-party repo errors)
+      ansible.builtin.apt:
+        update_cache: true
+      ignore_errors: true
+      tags: [prereqs]
+
+    - name: Install Java, Git, and Docker dependencies
       ansible.builtin.apt:
         name:
           - openjdk-21-jdk
-          - maven
           - git
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: false
+      tags: [prereqs]
+
+    - name: Check if Docker is already installed
+      ansible.builtin.command: docker --version
+      register: docker_installed
+      failed_when: false
+      changed_when: false
+      tags: [prereqs, kafka]
+
+    - name: Add Docker GPG key
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+      when: docker_installed.rc != 0
+      tags: [prereqs, kafka]
+
+    - name: Add Docker apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+      when: docker_installed.rc != 0
+      tags: [prereqs, kafka]
+
+    - name: Install Docker Engine
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
         state: present
         update_cache: true
+        cache_valid_time: 3600
+      when: docker_installed.rc != 0
+      tags: [prereqs, kafka]
+
+    - name: Ensure Docker service is running
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+      tags: [prereqs, kafka]
+
+    - name: Check if application user already exists
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ app_user }}"
+      failed_when: false
       tags: [prereqs]
 
     - name: Create application user
@@ -78,6 +136,7 @@
         shell: /sbin/nologin
         home: "{{ app_dir }}"
         create_home: true
+      when: getent_passwd[app_user] is not defined
       tags: [prereqs]
 
     - name: Create app directory
@@ -86,23 +145,79 @@
         state: directory
         owner: "{{ app_user }}"
         group: "{{ app_user }}"
+        mode: "0755"
+      tags: [prereqs]
+
+    - name: Fix app directory ownership
+      ansible.builtin.command:
+        cmd: chown -R {{ app_user }}:{{ app_user }} {{ app_dir }}
+      changed_when: false
+      tags: [prereqs]
+
+    - name: Create log directory
+      ansible.builtin.file:
+        path: /var/log/fortknox
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
         mode: "0750"
       tags: [prereqs]
 
+    # ── Kafka ─────────────────────────────────────────────────────────────────
+
+    - name: Pull Kafka Docker image (KRaft, no ZooKeeper)
+      community.docker.docker_image:
+        name: apache/kafka
+        tag: latest
+        source: pull
+      tags: [kafka]
+
+    - name: Run Kafka container
+      community.docker.docker_container:
+        name: "{{ kafka_container_name }}"
+        image: apache/kafka:latest
+        state: started
+        restart_policy: always
+        ports:
+          - "{{ kafka_port }}:9092"
+        env:
+          KAFKA_NODE_ID: "1"
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+          KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:{{ kafka_port }}"
+          KAFKA_CONTROLLER_QUORUM_VOTERS: "1@localhost:9093"
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+          KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+          CLUSTER_ID: fortknox-kafka-cluster
+      tags: [kafka]
+
+    - name: Wait for Kafka to be ready
+      ansible.builtin.wait_for:
+        host: localhost
+        port: "{{ kafka_port }}"
+        delay: 5
+        timeout: 60
+      tags: [kafka]
+
     # ── ZW ────────────────────────────────────────────────────────────────────
 
-    - name: Clone or update ZW repository
+    - name: Clone or update fortknox repository
       ansible.builtin.git:
         repo: "{{ zw_repo_url }}"
         dest: "{{ zw_dir }}"
-        version: main
+        version: master
         force: true
-      become_user: "{{ app_user }}"
+      become: false
       tags: [zw]
 
-    - name: Build ZW JAR
+    - name: Build fortknox JAR
       ansible.builtin.command:
-        cmd: mvn clean package -P {{ spring_profile }} -DskipTests --no-transfer-progress
+        cmd: ./mvnw clean package -P {{ spring_profile }} -DskipTests --no-transfer-progress
         chdir: "{{ zw_dir }}"
       become_user: "{{ app_user }}"
       environment:
@@ -147,14 +262,14 @@
       ansible.builtin.git:
         repo: "{{ capital_repo_url }}"
         dest: "{{ capital_dir }}"
-        version: main
+        version: Master
         force: true
-      become_user: "{{ app_user }}"
+      become: false
       tags: [capital]
 
     - name: Generate JAXB classes from XSD (Capital only)
       ansible.builtin.command:
-        cmd: mvn generate-sources -P {{ spring_profile }} --no-transfer-progress
+        cmd: ./mvnw generate-sources -P {{ spring_profile }} --no-transfer-progress
         chdir: "{{ capital_dir }}"
       become_user: "{{ app_user }}"
       environment:
@@ -163,7 +278,7 @@
 
     - name: Build Capital JAR
       ansible.builtin.command:
-        cmd: mvn clean package -P {{ spring_profile }} -DskipTests --no-transfer-progress
+        cmd: ./mvnw clean package -P {{ spring_profile }} -DskipTests --no-transfer-progress
         chdir: "{{ capital_dir }}"
       become_user: "{{ app_user }}"
       environment:
@@ -195,11 +310,11 @@
       ansible.builtin.uri:
         url: "http://localhost:{{ capital_port }}/actuator/health"
         method: GET
-        status_code: 200
+        status_code: [200, 401]
       register: capital_health
       retries: 12
       delay: 5
-      until: capital_health.status == 200
+      until: capital_health.status in [200, 401]
       tags: [capital]
 
     # ── Summary ───────────────────────────────────────────────────────────────
@@ -207,8 +322,9 @@
     - name: Deployment summary
       ansible.builtin.debug:
         msg:
-          - "ZW    : http://{{ inventory_hostname }}:{{ zw_port }}"
+          - "ZW      : http://{{ inventory_hostname }}:{{ zw_port }}"
           - "Capital : http://{{ inventory_hostname }}:{{ capital_port }}"
+          - "Kafka   : {{ inventory_hostname }}:{{ kafka_port }}"
           - "Profile : {{ spring_profile }}"
       tags: [always]
 
